@@ -2,7 +2,9 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using NAudio.CoreAudioApi;
 using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 using Whisper.net;
 using Whisper.net.Ggml;
 
@@ -13,7 +15,6 @@ class Overlay : Form
 {
     static readonly Color Cyan = Color.FromArgb(0, 240, 255), Muted = Color.FromArgb(115, 131, 156),
         Main = Color.FromArgb(7, 10, 18), Card = Color.FromArgb(15, 20, 34), Red = Color.FromArgb(255, 0, 60);
-    static readonly HttpClient Http = new();
     static readonly (string Name, string Code)[] Targets =
     {
         ("Polish", "pl"), ("English", "en"), ("German", "de"), ("French", "fr"),
@@ -27,11 +28,14 @@ class Overlay : Form
     readonly Label lblInfo = new() { AutoSize = true, ForeColor = Muted, Font = new Font("Consolas", 8), Margin = new Padding(8, 9, 0, 0), Text = "starting..." };
     readonly Button btnRec = Btn("●");
     readonly Button btnPin = Btn("📌");
+    readonly Button btnSrc = Btn("🎤");
     readonly CheckBox chkTr = new() { Text = "Translate →", AutoSize = true, ForeColor = Muted, Font = new Font("Consolas", 9), Margin = new Padding(10, 7, 0, 0) };
     readonly ComboBox cbTarget = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 95, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(15, 20, 34), ForeColor = Cyan, Margin = new Padding(3, 3, 0, 0) };
 
     WhisperProcessor? processor;
-    WaveInEvent? mic;
+    WaveIn? mic;
+    WasapiRecorder? loopback;
+    bool useSystemAudio;
     readonly List<byte> buffer = new();
     int silentMs;
     bool hasSpeech, busy;
@@ -61,7 +65,7 @@ class Overlay : Form
         btnClose.ForeColor = Red;
         btnClose.Click += (_, _) => Close();
         btnClose.Dock = DockStyle.None;
-        bar.Controls.AddRange(new Control[] { handle, btnRec, btnPin, chkTr, cbTarget, lblInfo });
+        bar.Controls.AddRange(new Control[] { handle, btnRec, btnSrc, btnPin, chkTr, cbTarget, lblInfo });
 
         Controls.Add(lblText);
         Controls.Add(lblTr);
@@ -80,8 +84,9 @@ class Overlay : Form
         btnRec.Click += (_, _) => Toggle();
         btnPin.ForeColor = Cyan;
         btnPin.Click += (_, _) => TogglePin();
+        btnSrc.Click += (_, _) => ToggleSource();
         Load += async (_, _) => await Init();
-        FormClosing += (_, _) => { mic?.Dispose(); processor?.Dispose(); Translator.Dispose(); };
+        FormClosing += (_, _) => { mic?.Dispose(); loopback?.Dispose(); processor?.Dispose(); Translator.Dispose(); };
     }
 
     static Button Btn(string t) => new()
@@ -121,31 +126,50 @@ class Overlay : Form
         lblInfo.Text = TopMost ? "pinned on top" : "unpinned";
     }
 
+    void ToggleSource()
+    {
+        if (mic != null || loopback != null) return; // don't switch mid-recording
+        useSystemAudio = !useSystemAudio;
+        btnSrc.Text = useSystemAudio ? "🔊" : "🎤";
+        lblInfo.Text = useSystemAudio ? "source: system audio (YouTube etc.)" : "source: microphone";
+    }
+
     void Toggle()
     {
         if (processor == null) return;
-        if (mic != null)
+        if (mic != null || loopback != null)
         {
-            mic.StopRecording(); mic.Dispose(); mic = null;
+            mic?.StopRecording(); mic?.Dispose(); mic = null;
+            if (loopback != null) { loopback.StopRecording(); loopback.Dispose(); loopback = null; }
             btnRec.ForeColor = Cyan; lblInfo.Text = "stopped";
             return;
         }
         buffer.Clear(); hasSpeech = false; silentMs = 0;
-        mic = new WaveInEvent { WaveFormat = new WaveFormat(16000, 16, 1), BufferMilliseconds = 100 };
-        mic.DataAvailable += OnData;
-        mic.StartRecording();
+
+        if (useSystemAudio)
+        {
+            loopback = new WasapiRecorderBuilder().WithLoopbackCapture().WithFormat(new WaveFormat(16000, 16, 1)).Build();
+            loopback.DataAvailable += (data, _, _, _) => FeedPcm16(data.ToArray());
+            loopback.StartRecording();
+        }
+        else
+        {
+            mic = new WaveIn { WaveFormat = new WaveFormat(16000, 16, 1), BufferMilliseconds = 100 };
+            mic.DataAvailable += (_, e) => FeedPcm16(new ArraySegment<byte>(e.Buffer, 0, e.BytesRecorded).ToArray());
+            mic.StartRecording();
+        }
         btnRec.ForeColor = Red; lblInfo.Text = "listening...";
     }
 
-    void OnData(object? s, WaveInEventArgs e)
+    void FeedPcm16(byte[] pcm)
     {
-        double sum = 0; int n = e.BytesRecorded / 2;
-        for (int i = 0; i < n; i++) { short v = BitConverter.ToInt16(e.Buffer, i * 2); sum += (double)v * v; }
+        double sum = 0; int n = pcm.Length / 2;
+        for (int i = 0; i < n; i++) { short v = BitConverter.ToInt16(pcm, i * 2); sum += (double)v * v; }
         bool speech = Math.Sqrt(sum / Math.Max(n, 1)) > 500;
 
         if (speech) { hasSpeech = true; silentMs = 0; } else silentMs += 100;
 
-        buffer.AddRange(new ArraySegment<byte>(e.Buffer, 0, e.BytesRecorded));
+        buffer.AddRange(pcm);
         if (!hasSpeech && buffer.Count > 16000) buffer.RemoveRange(0, buffer.Count - 16000);
 
         bool flush = hasSpeech && (silentMs >= 700 || buffer.Count > 16000 * 2 * 12);
