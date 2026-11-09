@@ -21,30 +21,40 @@ class Overlay : Form
         ("Spanish", "es"), ("Italian", "it"), ("Russian", "ru"), ("Ukrainian", "uk"), ("Czech", "cs")
     };
     static readonly string ModelPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SpeechToText", "ggml-small.bin");
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SpeechToText", "ggml-tiny.bin");
 
-    readonly Label lblText = new() { Dock = DockStyle.Fill, ForeColor = Color.White, Font = new Font("Consolas", 12), Padding = new Padding(10, 4, 10, 6) };
+    readonly RichTextBox transcript = new()
+    {
+        Dock = DockStyle.Fill, ReadOnly = true, BorderStyle = BorderStyle.None, DetectUrls = false,
+        BackColor = Main, ForeColor = Color.White, Font = new Font("Consolas", 12),
+        Padding = new Padding(10, 4, 10, 6), ScrollBars = RichTextBoxScrollBars.Vertical, WordWrap = true
+    };
     readonly Label lblTr = new() { Dock = DockStyle.Bottom, Height = 60, ForeColor = Cyan, Font = new Font("Consolas", 12, FontStyle.Bold), Padding = new Padding(10, 0, 10, 6) };
     readonly Label lblInfo = new() { AutoSize = true, ForeColor = Muted, Font = new Font("Consolas", 8), Margin = new Padding(8, 9, 0, 0), Text = "starting..." };
-    readonly Button btnRec = Btn("●");
+    readonly Button btnRec = Btn("▶");
     readonly Button btnPin = Btn("📌");
-    readonly Button btnSrc = Btn("🎤");
     readonly CheckBox chkTr = new() { Text = "Translate →", AutoSize = true, ForeColor = Muted, Font = new Font("Consolas", 9), Margin = new Padding(10, 7, 0, 0) };
     readonly ComboBox cbTarget = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 95, FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(15, 20, 34), ForeColor = Cyan, Margin = new Padding(3, 3, 0, 0) };
 
     WhisperProcessor? processor;
-    WaveIn? mic;
     WasapiRecorder? loopback;
-    bool useSystemAudio;
+    readonly object audioLock = new();
     readonly List<byte> buffer = new();
-    int silentMs;
-    bool hasSpeech, busy;
+    readonly Queue<(byte[] Pcm, bool Final, int Generation)> transcriptionQueue = new();
+    readonly List<string> liveWords = new();
+    string finalizedText = "";
+    int silentBytes, lastPartialBytes;
+    int sessionGeneration;
+    bool workerRunning;
+    bool hasSpeech;
 
     public Overlay()
     {
         FormBorderStyle = FormBorderStyle.None;
+        Text = "Speech to Text";
+        Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
         TopMost = true;
-        ShowInTaskbar = false;
+        ShowInTaskbar = true;
         BackColor = Main;
         Opacity = 0.94;
         Padding = new Padding(1);
@@ -65,9 +75,9 @@ class Overlay : Form
         btnClose.ForeColor = Red;
         btnClose.Click += (_, _) => Close();
         btnClose.Dock = DockStyle.None;
-        bar.Controls.AddRange(new Control[] { handle, btnRec, btnSrc, btnPin, chkTr, cbTarget, lblInfo });
+        bar.Controls.AddRange(new Control[] { handle, btnRec, btnPin, chkTr, cbTarget, lblInfo });
 
-        Controls.Add(lblText);
+        Controls.Add(transcript);
         Controls.Add(lblTr);
         Controls.Add(bar);
         Controls.Add(btnClose);
@@ -78,15 +88,14 @@ class Overlay : Form
         foreach (var t in Targets) cbTarget.Items.Add(t.Name);
         cbTarget.SelectedIndex = 1;
 
-        foreach (Control c in new Control[] { bar, handle, lblText, lblTr, lblInfo })
+        foreach (Control c in new Control[] { bar, handle, lblTr, lblInfo })
             c.MouseDown += (_, e) => { if (e.Button == MouseButtons.Left) { ReleaseCapture(); SendMessage(Handle, 0xA1, 2, 0); } };
 
         btnRec.Click += (_, _) => Toggle();
         btnPin.ForeColor = Cyan;
         btnPin.Click += (_, _) => TogglePin();
-        btnSrc.Click += (_, _) => ToggleSource();
         Load += async (_, _) => await Init();
-        FormClosing += (_, _) => { mic?.Dispose(); loopback?.Dispose(); processor?.Dispose(); Translator.Dispose(); };
+        FormClosing += (_, _) => { loopback?.Dispose(); processor?.Dispose(); Translator.Dispose(); };
     }
 
     static Button Btn(string t) => new()
@@ -106,15 +115,15 @@ class Overlay : Form
             if (!File.Exists(ModelPath))
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(ModelPath)!);
-                lblInfo.Text = "downloading model (~470 MB)...";
-                using var s = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(GgmlType.Small);
+                lblInfo.Text = "downloading fast model...";
+                using var s = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(GgmlType.Tiny);
                 using (var f = File.Create(ModelPath + ".tmp")) await s.CopyToAsync(f);
                 File.Move(ModelPath + ".tmp", ModelPath);
             }
             lblInfo.Text = "loading model...";
             var factory = WhisperFactory.FromPath(ModelPath);
-            processor = factory.CreateBuilder().WithLanguage("auto").Build();
-            lblInfo.Text = "ready - click ●";
+            processor = factory.CreateBuilder().WithLanguage("pl").WithNoContext().Build();
+            lblInfo.Text = "ready - click ▶";
         }
         catch (Exception ex) { lblInfo.Text = "error: " + ex.Message; }
     }
@@ -126,39 +135,63 @@ class Overlay : Form
         lblInfo.Text = TopMost ? "pinned on top" : "unpinned";
     }
 
-    void ToggleSource()
-    {
-        if (mic != null || loopback != null) return; // don't switch mid-recording
-        useSystemAudio = !useSystemAudio;
-        btnSrc.Text = useSystemAudio ? "🔊" : "🎤";
-        lblInfo.Text = useSystemAudio ? "source: system audio (YouTube etc.)" : "source: microphone";
-    }
-
     void Toggle()
     {
         if (processor == null) return;
-        if (mic != null || loopback != null)
+        if (loopback != null)
         {
-            mic?.StopRecording(); mic?.Dispose(); mic = null;
-            if (loopback != null) { loopback.StopRecording(); loopback.Dispose(); loopback = null; }
-            btnRec.ForeColor = Cyan; lblInfo.Text = "stopped";
+            loopback.StopRecording();
+            loopback.Dispose();
+            loopback = null;
+            bool startWorker = false;
+            lock (audioLock)
+            {
+                if (hasSpeech && buffer.Count > 0)
+                    transcriptionQueue.Enqueue((buffer.ToArray(), true, sessionGeneration));
+                buffer.Clear();
+                hasSpeech = false;
+                silentBytes = 0;
+                if (transcriptionQueue.Count > 0 && !workerRunning)
+                {
+                    workerRunning = true;
+                    startWorker = true;
+                }
+            }
+            btnRec.Text = "▶";
+            btnRec.ForeColor = Cyan;
+            lblInfo.Text = "stopped";
+            if (startWorker) _ = DrainTranscriptionQueue();
             return;
         }
-        buffer.Clear(); hasSpeech = false; silentMs = 0;
-
-        if (useSystemAudio)
+        lock (audioLock)
+        {
+            buffer.Clear();
+            transcriptionQueue.Clear();
+            finalizedText = "";
+            liveWords.Clear();
+            sessionGeneration++;
+            hasSpeech = false;
+            silentBytes = 0;
+            lastPartialBytes = 0;
+        }
+        transcript.Clear();
+        lblTr.Text = "";
+        try
         {
             loopback = new WasapiRecorderBuilder().WithLoopbackCapture().WithFormat(new WaveFormat(16000, 16, 1)).Build();
             loopback.DataAvailable += (data, _, _, _) => FeedPcm16(data.ToArray());
             loopback.StartRecording();
+            btnRec.Text = "■";
+            btnRec.ForeColor = Red;
+            lblInfo.Text = "listening to system audio...";
         }
-        else
+        catch (Exception ex)
         {
-            mic = new WaveIn { WaveFormat = new WaveFormat(16000, 16, 1), BufferMilliseconds = 100 };
-            mic.DataAvailable += (_, e) => FeedPcm16(new ArraySegment<byte>(e.Buffer, 0, e.BytesRecorded).ToArray());
-            mic.StartRecording();
+            loopback?.Dispose();
+            loopback = null;
+            btnRec.Text = "▶";
+            lblInfo.Text = "error: " + ex.Message;
         }
-        btnRec.ForeColor = Red; lblInfo.Text = "listening...";
     }
 
     void FeedPcm16(byte[] pcm)
@@ -166,54 +199,187 @@ class Overlay : Form
         double sum = 0; int n = pcm.Length / 2;
         for (int i = 0; i < n; i++) { short v = BitConverter.ToInt16(pcm, i * 2); sum += (double)v * v; }
         bool speech = Math.Sqrt(sum / Math.Max(n, 1)) > 500;
-
-        if (speech) { hasSpeech = true; silentMs = 0; } else silentMs += 100;
-
-        buffer.AddRange(pcm);
-        if (!hasSpeech && buffer.Count > 16000) buffer.RemoveRange(0, buffer.Count - 16000);
-
-        bool flush = hasSpeech && (silentMs >= 700 || buffer.Count > 16000 * 2 * 12);
-        if (flush && !busy)
+        bool startWorker = false;
+        lock (audioLock)
         {
-            var data = buffer.ToArray();
-            buffer.Clear(); hasSpeech = false; silentMs = 0;
-            _ = Process(data);
+            buffer.AddRange(pcm);
+            if (speech) { hasSpeech = true; silentBytes = 0; }
+            else if (hasSpeech) silentBytes += pcm.Length;
+
+            if (!hasSpeech && buffer.Count > 32000)
+                buffer.RemoveRange(0, buffer.Count - 32000);
+
+            if (hasSpeech && (silentBytes >= 22400 || buffer.Count >= 16000 * 2 * 12))
+            {
+                transcriptionQueue.Enqueue((buffer.ToArray(), true, sessionGeneration));
+                buffer.Clear();
+                hasSpeech = false;
+                silentBytes = 0;
+                lastPartialBytes = 0;
+            }
+            else if (hasSpeech && buffer.Count - lastPartialBytes >= 9600 && !workerRunning)
+            {
+                int start = Math.Max(0, buffer.Count - 16000 * 2 * 2);
+                transcriptionQueue.Enqueue((buffer.Skip(start).ToArray(), false, sessionGeneration));
+                lastPartialBytes = buffer.Count;
+            }
+
+            if (transcriptionQueue.Count > 0 && !workerRunning)
+            {
+                workerRunning = true;
+                startWorker = true;
+            }
+        }
+        if (startWorker) _ = DrainTranscriptionQueue();
+    }
+
+    async Task DrainTranscriptionQueue()
+    {
+        while (true)
+        {
+            (byte[] Pcm, bool Final, int Generation) work;
+            lock (audioLock)
+            {
+                if (transcriptionQueue.Count == 0)
+                {
+                    workerRunning = false;
+                    return;
+                }
+                work = transcriptionQueue.Dequeue();
+            }
+
+            await Process(work.Pcm, work.Final, work.Generation);
         }
     }
 
-    async Task Process(byte[] pcm)
+    async Task Process(byte[] pcm, bool isFinal, int workGeneration)
     {
-        busy = true;
         try
         {
-            BeginInvoke(() => lblInfo.Text = "processing...");
-            var ms = new MemoryStream();
+            BeginInvoke(() =>
+            {
+                lock (audioLock)
+                    if (workGeneration == sessionGeneration) lblInfo.Text = "transcribing...";
+            });
+            using var ms = new MemoryStream();
             using (var w = new WaveFileWriter(new NonClosing(ms), new WaveFormat(16000, 16, 1))) w.Write(pcm, 0, pcm.Length);
             ms.Position = 0;
 
-            var text = new System.Text.StringBuilder(); string lang = "";
+            var text = new StringBuilder(); string lang = "";
             await foreach (var seg in processor!.ProcessAsync(ms))
             {
                 text.Append(seg.Text); lang = seg.Language;
             }
             string t = text.ToString().Trim();
-            if (t.Length < 2 || t.StartsWith('[') || t.StartsWith('('))
+            if (t.Length >= 2 && !t.StartsWith('[') && !t.StartsWith('('))
             {
-                BeginInvoke(() => lblInfo.Text = mic != null ? "listening..." : "stopped");
-                return;
+                string displayedText;
+                lock (audioLock)
+                {
+                    if (workGeneration != sessionGeneration) return;
+                    MergeLiveWords(liveWords, t);
+                    if (isFinal)
+                    {
+                        finalizedText = KeepLast1000Words(string.Join(" ", finalizedText, string.Join(" ", liveWords)).Trim());
+                        liveWords.Clear();
+                    }
+                    string allWords = string.Join(" ", finalizedText, string.Join(" ", liveWords)).Trim();
+                    displayedText = FormatWordsOnLines(allWords);
+                }
+                BeginInvoke(() =>
+                {
+                    lock (audioLock)
+                        if (workGeneration == sessionGeneration)
+                        {
+                            SetTranscriptText(displayedText);
+                            lblInfo.Text = loopback != null ? $"[{lang}] listening..." : $"[{lang}]";
+                        }
+                });
+                if (isFinal && chkTr.Checked)
+                {
+                    string dst = "en";
+                    Invoke(() => dst = Targets[cbTarget.SelectedIndex].Code);
+                    string tr = await Translate(t, lang, dst);
+                    BeginInvoke(() =>
+                    {
+                        lock (audioLock)
+                            if (workGeneration == sessionGeneration) lblTr.Text = tr;
+                    });
+                }
             }
-            BeginInvoke(() => { lblText.Text = t; lblInfo.Text = $"[{lang}]"; });
-            if (chkTr.Checked)
+            else
             {
-                string dst = "en";
-                Invoke(() => dst = Targets[cbTarget.SelectedIndex].Code);
-                string tr = await Translate(t, lang, dst);
-                BeginInvoke(() => lblTr.Text = tr);
+                BeginInvoke(() =>
+                {
+                    lock (audioLock)
+                            if (workGeneration == sessionGeneration) lblInfo.Text = loopback != null ? "listening..." : "stopped";
+                });
             }
         }
-        catch (Exception ex) { BeginInvoke(() => lblInfo.Text = "error: " + ex.Message); }
-        finally { busy = false; }
+        catch (Exception ex)
+        {
+            BeginInvoke(() =>
+            {
+                lock (audioLock)
+                    if (workGeneration == sessionGeneration) lblInfo.Text = "error: " + ex.Message;
+            });
+        }
     }
+
+    void SetTranscriptText(string text)
+    {
+        int firstVisibleLine = SendMessage(transcript.Handle, 0xCE, 0, 0);
+        int bottomChar = transcript.GetCharIndexFromPosition(new Point(1, Math.Max(1, transcript.ClientSize.Height - 2)));
+        bool followTail = transcript.GetLineFromCharIndex(bottomChar) >= transcript.GetLineFromCharIndex(transcript.TextLength) - 1;
+        transcript.Text = text;
+        if (followTail)
+        {
+            transcript.SelectionStart = transcript.TextLength;
+            transcript.ScrollToCaret();
+            return;
+        }
+
+        int currentFirstLine = SendMessage(transcript.Handle, 0xCE, 0, 0);
+        SendMessage(transcript.Handle, 0xB6, 0, firstVisibleLine - currentFirstLine);
+    }
+
+    static string KeepLast1000Words(string text)
+    {
+        var words = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return words.Length <= 1000 ? text : string.Join(" ", words.Skip(words.Length - 1000));
+    }
+
+    static void MergeLiveWords(List<string> accumulated, string hypothesis)
+    {
+        var words = hypothesis.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        int overlap = 0, startAt = 0;
+        for (int length = Math.Min(accumulated.Count, words.Length); length > 0 && overlap == 0; length--)
+        {
+            int suffixStart = accumulated.Count - length;
+            for (int start = 0; start + length <= words.Length; start++)
+            {
+                bool matches = true;
+                for (int i = 0; i < length; i++)
+                {
+                    string oldWord = NormalizeWord(accumulated[suffixStart + i]);
+                    string newWord = NormalizeWord(words[start + i]);
+                    if (oldWord.Length == 0 || oldWord != newWord) { matches = false; break; }
+                }
+                if (!matches) continue;
+                overlap = length;
+                startAt = start + length;
+                break;
+            }
+        }
+
+        accumulated.AddRange(words.Skip(startAt));
+    }
+
+    static string NormalizeWord(string word) =>
+        new(word.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+
+    static string FormatWordsOnLines(string text) =>
+        string.Join(Environment.NewLine, text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
 
     
     static readonly LocalTranslator Translator = new();
