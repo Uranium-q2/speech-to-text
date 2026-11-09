@@ -29,7 +29,7 @@ class Overlay : Form
         BackColor = Main, ForeColor = Color.White, Font = new Font("Consolas", 12),
         Padding = new Padding(10, 4, 10, 6), ScrollBars = RichTextBoxScrollBars.Vertical, WordWrap = true
     };
-    readonly Label lblTr = new() { Dock = DockStyle.Bottom, Height = 60, ForeColor = Cyan, Font = new Font("Consolas", 12, FontStyle.Bold), Padding = new Padding(10, 0, 10, 6) };
+    readonly Label lblTr = new() { Dock = DockStyle.Bottom, Height = 60, ForeColor = Cyan, Font = new Font("Consolas", 12, FontStyle.Bold), Padding = new Padding(10, 0, 10, 6), Visible = false };
     readonly Label lblInfo = new() { AutoSize = true, ForeColor = Muted, Font = new Font("Consolas", 8), Margin = new Padding(8, 9, 0, 0), Text = "starting..." };
     readonly Button btnRec = Btn("▶");
     readonly Button btnPin = Btn("📌");
@@ -47,6 +47,10 @@ class Overlay : Form
     int sessionGeneration;
     bool workerRunning;
     bool hasSpeech;
+    bool resizing;
+    int resizeEdges;
+    Point resizeStart;
+    Rectangle resizeStartBounds;
 
     public Overlay()
     {
@@ -65,6 +69,7 @@ class Overlay : Form
             DwmSetWindowAttribute(Handle, 34, ref border, 4);
         };
         Size = new Size(620, 170);
+        MinimumSize = new Size(440, 150);
         StartPosition = FormStartPosition.Manual;
         var wa = Screen.PrimaryScreen!.WorkingArea;
         Location = new Point(wa.Left + (wa.Width - Width) / 2, wa.Bottom - Height - 20);
@@ -85,15 +90,24 @@ class Overlay : Form
         btnClose.Location = new Point(Width - 36, 2);
         btnClose.BringToFront();
 
+        AttachResizeHandlers(this);
         foreach (var t in Targets) cbTarget.Items.Add(t.Name);
         cbTarget.SelectedIndex = 1;
 
         foreach (Control c in new Control[] { bar, handle, lblTr, lblInfo })
-            c.MouseDown += (_, e) => { if (e.Button == MouseButtons.Left) { ReleaseCapture(); SendMessage(Handle, 0xA1, 2, 0); } };
+            c.MouseDown += (_, e) =>
+            {
+                if (e.Button == MouseButtons.Left && !resizing)
+                {
+                    ReleaseCapture();
+                    SendMessage(Handle, 0xA1, 2, 0);
+                }
+            };
 
         btnRec.Click += (_, _) => Toggle();
         btnPin.ForeColor = Cyan;
         btnPin.Click += (_, _) => TogglePin();
+        chkTr.CheckedChanged += (_, _) => lblTr.Visible = chkTr.Checked;
         Load += async (_, _) => await Init();
         FormClosing += (_, _) => { loopback?.Dispose(); processor?.Dispose(); Translator.Dispose(); };
     }
@@ -103,6 +117,54 @@ class Overlay : Form
         Text = t, Width = 32, Height = 28, FlatStyle = FlatStyle.Flat, ForeColor = Cyan, Font = new Font("Consolas", 10, FontStyle.Bold),
         BackColor = Card, Margin = new Padding(2, 2, 0, 0), FlatAppearance = { BorderColor = Color.FromArgb(27, 37, 59) }
     };
+
+    void AttachResizeHandlers(Control control)
+    {
+        control.MouseDown += ResizeMouseDown;
+        control.MouseMove += ResizeMouseMove;
+        control.MouseUp += ResizeMouseUp;
+        foreach (Control child in control.Controls) AttachResizeHandlers(child);
+    }
+
+    void ResizeMouseDown(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        Point point = PointToClient(Cursor.Position);
+        resizeEdges = 0;
+        const int grip = 8;
+        if (point.X < grip) resizeEdges |= 1;
+        else if (point.X >= ClientSize.Width - grip) resizeEdges |= 2;
+        if (point.Y < grip) resizeEdges |= 4;
+        else if (point.Y >= ClientSize.Height - grip) resizeEdges |= 8;
+        if (resizeEdges == 0) return;
+
+        resizing = true;
+        resizeStart = Cursor.Position;
+        resizeStartBounds = Bounds;
+        Capture = true;
+    }
+
+    void ResizeMouseMove(object? sender, MouseEventArgs e)
+    {
+        if (!resizing) return;
+        Point current = Cursor.Position;
+        int dx = current.X - resizeStart.X, dy = current.Y - resizeStart.Y;
+        int left = resizeStartBounds.Left, top = resizeStartBounds.Top;
+        int right = resizeStartBounds.Right, bottom = resizeStartBounds.Bottom;
+        if ((resizeEdges & 1) != 0) left = Math.Min(right - MinimumSize.Width, left + dx);
+        if ((resizeEdges & 2) != 0) right = Math.Max(left + MinimumSize.Width, right + dx);
+        if ((resizeEdges & 4) != 0) top = Math.Min(bottom - MinimumSize.Height, top + dy);
+        if ((resizeEdges & 8) != 0) bottom = Math.Max(top + MinimumSize.Height, bottom + dy);
+        Bounds = Rectangle.FromLTRB(left, top, right, bottom);
+    }
+
+    void ResizeMouseUp(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left || !resizing) return;
+        resizing = false;
+        resizeEdges = 0;
+        Capture = false;
+    }
 
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int v, int size);
     [DllImport("user32.dll")] static extern bool ReleaseCapture();
@@ -284,7 +346,7 @@ class Overlay : Form
                         liveWords.Clear();
                     }
                     string allWords = string.Join(" ", finalizedText, string.Join(" ", liveWords)).Trim();
-                    displayedText = FormatWordsOnLines(allWords);
+                    displayedText = FormatTranscriptText(allWords);
                 }
                 BeginInvoke(() =>
                 {
@@ -378,8 +440,8 @@ class Overlay : Form
     static string NormalizeWord(string word) =>
         new(word.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
 
-    static string FormatWordsOnLines(string text) =>
-        string.Join(Environment.NewLine, text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+    static string FormatTranscriptText(string text) =>
+        string.Join(" ", text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
 
     
     static readonly LocalTranslator Translator = new();
