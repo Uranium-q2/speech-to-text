@@ -46,7 +46,7 @@ class Overlay : Form
         Padding = new Padding(1);
         HandleCreated += (_, _) =>
         {
-            int round = 2, border = 0xFFF000; // DWMWCP_ROUND, cyan (BGR)
+            int round = 2, border = 0xFFF000;
             DwmSetWindowAttribute(Handle, 33, ref round, 4);
             DwmSetWindowAttribute(Handle, 34, ref border, 4);
         };
@@ -78,7 +78,7 @@ class Overlay : Form
             c.MouseDown += (_, e) => { if (e.Button == MouseButtons.Left) { ReleaseCapture(); SendMessage(Handle, 0xA1, 2, 0); } };
 
         btnRec.Click += (_, _) => Toggle();
-        btnPin.ForeColor = Cyan; // pinned by default (TopMost = true)
+        btnPin.ForeColor = Cyan;
         btnPin.Click += (_, _) => TogglePin();
         Load += async (_, _) => await Init();
         FormClosing += (_, _) => { mic?.Dispose(); processor?.Dispose(); Translator.Dispose(); };
@@ -146,7 +146,7 @@ class Overlay : Form
         if (speech) { hasSpeech = true; silentMs = 0; } else silentMs += 100;
 
         buffer.AddRange(new ArraySegment<byte>(e.Buffer, 0, e.BytesRecorded));
-        if (!hasSpeech && buffer.Count > 16000) buffer.RemoveRange(0, buffer.Count - 16000); // ~0.5 s pre-roll
+        if (!hasSpeech && buffer.Count > 16000) buffer.RemoveRange(0, buffer.Count - 16000);
 
         bool flush = hasSpeech && (silentMs >= 700 || buffer.Count > 16000 * 2 * 12);
         if (flush && !busy)
@@ -191,8 +191,7 @@ class Overlay : Form
         finally { busy = false; }
     }
 
-    // Fully local translation (Argos Translate, run as a persistent Python subprocess).
-    // No internet, no API key, no character limit.
+    
     static readonly LocalTranslator Translator = new();
 
     static Task<string> Translate(string text, string from, string to) => Translator.Translate(text, from, to);
