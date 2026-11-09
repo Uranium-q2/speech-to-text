@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using NAudio.Wave;
 using Whisper.net;
@@ -79,7 +81,7 @@ class Overlay : Form
         btnPin.ForeColor = Cyan; // pinned by default (TopMost = true)
         btnPin.Click += (_, _) => TogglePin();
         Load += async (_, _) => await Init();
-        FormClosing += (_, _) => { mic?.Dispose(); processor?.Dispose(); };
+        FormClosing += (_, _) => { mic?.Dispose(); processor?.Dispose(); Translator.Dispose(); };
     }
 
     static Button Btn(string t) => new()
@@ -189,13 +191,64 @@ class Overlay : Form
         finally { busy = false; }
     }
 
-    // MyMemory - free, no API key (limit ~5000 chars/day)
-    static async Task<string> Translate(string text, string from, string to)
+    // Fully local translation (Argos Translate, run as a persistent Python subprocess).
+    // No internet, no API key, no character limit.
+    static readonly LocalTranslator Translator = new();
+
+    static Task<string> Translate(string text, string from, string to) => Translator.Translate(text, from, to);
+
+    sealed class LocalTranslator : IDisposable
     {
-        if (from == to) return text;
-        string url = $"https://api.mymemory.translated.net/get?q={Uri.EscapeDataString(text)}&langpair={from}|{to}";
-        using var doc = JsonDocument.Parse(await Http.GetStringAsync(url));
-        return doc.RootElement.GetProperty("responseData").GetProperty("translatedText").GetString() ?? "";
+        static readonly string ScriptPath = Path.Combine(AppContext.BaseDirectory, "translator_service.py");
+        System.Diagnostics.Process? proc;
+        readonly SemaphoreSlim gate = new(1, 1);
+
+        void EnsureStarted()
+        {
+            if (proc is { HasExited: false }) return;
+            string script = File.Exists(ScriptPath)
+                ? ScriptPath
+                : Path.Combine(Directory.GetCurrentDirectory(), "translator_service.py");
+            var psi = new ProcessStartInfo("python", $"\"{script}\"")
+            {
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                StandardInputEncoding = Encoding.UTF8,
+                StandardOutputEncoding = Encoding.UTF8,
+                EnvironmentVariables = { ["PYTHONIOENCODING"] = "utf-8" }
+            };
+            proc = System.Diagnostics.Process.Start(psi) ?? throw new InvalidOperationException("Could not start python translator_service.py");
+        }
+
+        public async Task<string> Translate(string text, string from, string to)
+        {
+            if (from == to || string.IsNullOrWhiteSpace(text)) return text;
+            await gate.WaitAsync();
+            try
+            {
+                EnsureStarted();
+                var req = JsonSerializer.Serialize(new { text, from, to });
+                await proc!.StandardInput.WriteLineAsync(req);
+                await proc.StandardInput.FlushAsync();
+                string? line = await proc.StandardOutput.ReadLineAsync();
+                if (line == null) throw new InvalidOperationException("translator process closed unexpectedly");
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (!root.GetProperty("ok").GetBoolean())
+                    throw new InvalidOperationException(root.TryGetProperty("error", out var e) ? e.GetString() : "unknown error");
+                return root.GetProperty("text").GetString() ?? text;
+            }
+            finally { gate.Release(); }
+        }
+
+        public void Dispose()
+        {
+            try { if (proc is { HasExited: false }) proc.Kill(); } catch { /* ignore */ }
+            proc?.Dispose();
+        }
     }
 
     sealed class NonClosing(Stream inner) : Stream
